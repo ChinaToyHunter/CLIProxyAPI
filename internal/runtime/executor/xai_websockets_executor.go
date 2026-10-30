@@ -834,8 +834,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 				}
 				for _, payload := range events {
 					eventType := gjson.GetBytes(payload, "type").String()
-					patchTerminal := prepared.applyPatch.Active() && (eventType == "response.incomplete" || eventType == "response.failed")
-					isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "error" || patchTerminal
+					isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" || eventType == "response.failed" || eventType == "error"
 					reporter.ObserveResponseModel(payload)
 					warmupCompletedPayload := []byte(nil)
 					switch eventType {
@@ -935,7 +934,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 						helps.StopApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
 						return
 					}
-					if eventType == "response.completed" || eventType == "response.done" || patchTerminal {
+					if isTerminalEvent {
 						return
 					}
 				}

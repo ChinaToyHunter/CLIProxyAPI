@@ -80,23 +80,32 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		return resp, xaiStatusErr(httpResp.StatusCode, data)
 	}
 
-	data, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
-	}
-	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
 	responseFilter := newXAIInternalXSearchResponseFilter(prepared.filterInternalXSearch, prepared.clientDeclaredTools)
 	namespaceRestorer := newXAINamespaceRestorer(prepared.namespaceTools)
 	var upstreamUsage helps.StreamUsageBuffer
-	for _, line := range bytes.Split(data, []byte("\n")) {
+	scanner := helps.NewCodexSSEScanner(ctx, httpResp.Body, 52_428_800)
+	scanner.SetOnLine(func(line []byte) { helps.AppendAPIResponseChunk(ctx, e.cfg, line) })
+	for scanner.Scan() {
+		line := scanner.Bytes()
 		if !bytes.HasPrefix(line, xaiDataTag) {
 			continue
 		}
-		eventData := xaiNormalizeReasoningSummaryData(bytes.TrimSpace(line[len(xaiDataTag):]))
+		eventData := helps.NormalizeXAIResponseEvent(xaiNormalizeReasoningSummaryData(bytes.TrimSpace(line[len(xaiDataTag):])))
+		if bytes.Equal(eventData, []byte("[DONE]")) {
+			if errFinish := prepared.applyPatch.Finish(); errFinish != nil {
+				errFailure := statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+				upstreamUsage.PublishFailure(ctx, reporter, errFailure)
+				return resp, errFailure
+			}
+			return resp, statusErr{code: http.StatusBadGateway, msg: "xai stream ended without a response terminal event"}
+		}
+		if body, failed := codexTerminalFailureBody(eventData); failed {
+			errFailure := xaiStatusErr(codexTerminalFailureStatus(body), body)
+			upstreamUsage.PublishFailure(ctx, reporter, errFailure)
+			return resp, errFailure
+		}
 		if detail, ok := helps.ParseCodexUsage(eventData); ok {
 			upstreamUsage.Observe(detail, true)
 		}
@@ -147,6 +156,10 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		}
 	}
 
+	if errScan := scanner.Err(); errScan != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+		return resp, errScan
+	}
 	if errFinish := prepared.applyPatch.Finish(); errFinish != nil {
 		errFinish = statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
 		upstreamUsage.PublishFailure(ctx, reporter, errFinish)
